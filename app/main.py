@@ -2,7 +2,8 @@
 POST /v1/standard-addition 标准加入法定量、
 POST /v1/integrate 原始强度采样峰面积积分、
 POST /v1/blank-subtraction 样本/空白两次运行的空白扣除，
-/v1/blank-subtraction-batches 共用空白的可复核批次（SQLite 持久化）。"""
+/v1/blank-subtraction-batches 共用空白的可复核批次（SQLite 持久化），
+含多次进样精密度检查（只读，不写库）。"""
 
 from __future__ import annotations
 
@@ -24,6 +25,8 @@ from .models import (
     BlankSubtractionResponse,
     IntegrateRequest,
     IntegrateResponse,
+    PrecisionCheckRequest,
+    PrecisionCheckResponse,
     StandardAdditionRequest,
     StandardAdditionResponse,
 )
@@ -31,16 +34,18 @@ from .standard_addition import standard_addition
 from .storage import (
     AlreadyConfirmed,
     BatchNotFound,
+    SampleNotConfirmed,
     SampleNotFound,
     StaleVersion,
 )
 
 app = FastAPI(
     title="离线色谱峰归属 API",
-    version="1.1.0",
+    version="1.2.0",
     description="基于两对互异内标的正斜率仿射校准与保序一对一峰归属；"
     "另提供标准加入法定量、原始强度采样峰面积积分、空白扣除，"
-    "以及共用空白的可复核批次（确认/换空白重算，SQLite 持久化）。",
+    "以及共用空白的可复核批次（确认/换空白重算/多次进样精密度检查，"
+    "SQLite 持久化）。",
 )
 
 
@@ -71,6 +76,14 @@ async def stale_version_handler(
 async def already_confirmed_handler(
     request: Request, exc: AlreadyConfirmed
 ) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(SampleNotConfirmed)
+async def sample_not_confirmed_handler(
+    request: Request, exc: SampleNotConfirmed
+) -> JSONResponse:
+    # 精密度检查只使用已确认样本的扣除结果：未确认 -> 409。
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
@@ -190,4 +203,20 @@ def batch_replace_blank(
         batch_id,
         {"blank": request.blank.model_dump(),
          "expected_version": request.expected_version},
+    )
+
+
+@app.post(
+    "/v1/blank-subtraction-batches/{batch_id}/precision-check",
+    response_model=PrecisionCheckResponse,
+)
+def batch_precision_check(
+    batch_id: str, request: PrecisionCheckRequest
+) -> dict:
+    # 只读检查：单次完整读取批次快照后纯计算，不写库、不改变确认或版本。
+    return batches.check_precision(
+        batch_id,
+        list(request.sample_ids),
+        request.target_ref_id,
+        request.max_rsd_percent,
     )

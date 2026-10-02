@@ -60,6 +60,10 @@ class AlreadyConfirmed(Exception):
     """样本已确认，不能覆盖确认状态，API 层映射为 409。"""
 
 
+class SampleNotConfirmed(Exception):
+    """精密度检查只使用已确认样本的扣除结果，API 层映射为 409。"""
+
+
 class ConfirmedResultChanged(Exception):
     """替换 blank 会改变已确认样本的结果，API 层映射为 409。"""
 

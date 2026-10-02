@@ -14,6 +14,9 @@
   初始版本 1、全部未确认；支持读取、按样本 id 逐项确认、替换 blank 后整批重算。
   修改携带 `expected_version` 乐观锁，成功版本加 1，过期返回 409；
   已确认结果约束 blank 替换——峰顺序、参考 id、`time_ms`、约分校正面积任一改变即整批拒绝。
+- **精密度检查**：对批次中 2～8 个**已确认**样本（同一样本的多次进样），以
+  目标校正面积 ÷ 第一内标校正面积得到面积比，精确计算均值 μ、样本方差 s²（分母 N−1）
+  与 q = s²/μ²，按 `10000·q ≤ 阈值²` 判定 RSD 是否合格；只读不写库。
 
 Python 3.12 + FastAPI，全部时间/偏差/拟合/面积计算使用 `fractions.Fraction` 精确有理数，
 返回约分后的 `n/d`。
@@ -30,6 +33,7 @@ docker compose up --build -d
 - 峰面积积分：`POST http://localhost:8000/v1/integrate`
 - 空白扣除：`POST http://localhost:8000/v1/blank-subtraction`
 - 可复核批次：`POST/GET http://localhost:8000/v1/blank-subtraction-batches`
+- 精密度检查：`POST http://localhost:8000/v1/blank-subtraction-batches/{batch_id}/precision-check`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互文档：`http://localhost:8000/docs`（Swagger UI）
 
@@ -737,15 +741,111 @@ curl -s -X POST \
 # => {"detail":"replacing the blank would change the confirmed result of sample 'run-01'"}
 ```
 
+### `POST .../{batch_id}/precision-check`（多次进样精密度检查）
+
+检查批次中**同一样本多次进样**（2～8 个互异样本 id）的精密度。只使用本次
+**单次完整读取**中**已确认**样本的扣除结果，逐样本计算
+
+```
+面积比 = 目标参考峰校正面积 ÷ 第一内标（is_ref_id_1）校正面积
+```
+
+再对面积比精确计算均值 `μ`、样本方差 `s²`（分母 **N−1**）与 `q = s²/μ²`，
+以 **`10000·q ≤ max_rsd_percent²`** 判定 RSD（百分数）是否不超过阈值
+（**等号通过**）。全程 `Fraction` 精确计算；**检查不写库**——确认状态、
+结果与版本都保持不变，响应中的 `version` 即本次读取看到的版本。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `sample_ids` | 字符串数组，长度 **2～8** | 批次内**互异**、非空的样本 id；面积比按此顺序返回 |
+| `target_ref_id` | 字符串 | 目标参考峰 id，必须存在于参考峰表且**不是**内标 |
+| `max_rsd_percent` | 整数 **0～100** | 允许的最大 RSD 百分比 |
+
+下面是一个**从创建、确认到检查**的完整可执行示例（依赖 `jq` 组装请求体）。
+3 次进样共用同一全零空白，仅目标峰高不同（1、2、3），内标峰高 2、1，
+故校正面积比为 `1/2`、`1`、`3/2`：
+
+```bash
+# 1) 创建批次（版本 1，全部未确认）
+SAMPLES=$(jq -n '[1, 2, 3] | map(. as $h | {
+  id: "r\($h)",
+  samples: ([0, $h, 0, 2, 0, 0, 1, 0, 0] as $y |
+    [range(0; 9) | {time_ms: (2 * .), intensity: $y[.]}]),
+  start_index: 0, end_index: 8, apex_indices: [1, 3, 6],
+  is_apex_idx_1: 1, is_apex_idx_2: 2
+})')
+BID=$(jq -n --argjson samples "$SAMPLES" '{
+  reference_peaks: [{id:"T",time_ms:2},{id:"S1",time_ms:6},{id:"S2",time_ms:12}],
+  is_ref_id_1: "S1", is_ref_id_2: "S2", tolerance_ms: 0,
+  blank: {
+    samples: [range(0; 9) | {time_ms: (2 * .), intensity: 0}],
+    start_index: 0, end_index: 8, apex_indices: [1, 3, 6],
+    is_apex_idx_1: 1, is_apex_idx_2: 2
+  },
+  samples: $samples
+}' | curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches \
+  -H 'Content-Type: application/json' -d @- | jq -r .batch_id)
+
+# 2) 逐项确认 3 个样本（版本 1 -> 4）
+for SID in r1 r2 r3; do
+  V=$(curl -s http://localhost:8000/v1/blank-subtraction-batches/$BID | jq .version)
+  curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches/$BID/confirm \
+    -H 'Content-Type: application/json' \
+    -d "{\"sample_id\": \"$SID\", \"expected_version\": $V}" |
+    jq -c '{version, confirmed: [.samples[].confirmed]}'
+done
+# => {"version":2,"confirmed":[true,false,false]}
+# => {"version":3,"confirmed":[true,true,false]}
+# => {"version":4,"confirmed":[true,true,true]}
+
+# 3) 精密度检查：μ=1，s²=1/4，q=1/4；10000·q = 2500 = 50²，阈值 50 等号通过
+curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches/$BID/precision-check \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_ids": ["r1", "r2", "r3"], "target_ref_id": "T",
+       "max_rsd_percent": 50}'
+```
+
+响应（`area_ratios` 与请求 `sample_ids` **同序**；面积比、`mean`、`variance`、
+`q` 均为约分分数 `{"n", "d"}`，分母恒正）：
+
+```json
+{
+  "batch_id": "619c6b01eaa64c7fbefec3ac8f74c007",
+  "version": 4,
+  "target_ref_id": "T",
+  "max_rsd_percent": 50,
+  "area_ratios": [
+    {"sample_id": "r1", "area_ratio": {"n": 1, "d": 2}},
+    {"sample_id": "r2", "area_ratio": {"n": 1, "d": 1}},
+    {"sample_id": "r3", "area_ratio": {"n": 3, "d": 2}}
+  ],
+  "mean": {"n": 1, "d": 1},
+  "variance": {"n": 1, "d": 4},
+  "q": {"n": 1, "d": 4},
+  "passed": true
+}
+```
+
+把 `max_rsd_percent` 改为 `49` 则 `passed` 为 `false`（`49² = 2401 < 2500`）。
+检查可任意重复：版本与确认状态保持不变（上例再读仍为 `version 4`、全部已确认）。
+
+错误码：批次或样本 id 不存在 **404**；任一样本未确认 **409**；其余非法输入
+**422**——目标为内标或不在参考峰表、样本 id 重复/数量越界/为空、阈值越界、
+目标峰在某样本结果中未归属、第一内标校正面积为 0（后两者消息指出样本 id，
+形如 `sample "r2": ...`）、均值 μ 为 0（RSD 无定义）。**零目标面积保留**
+（面积比为 0 参与计算）。错误优先级：404 → 409 → 422。
+
 ### 错误码汇总
 
 | 状态 | 触发情形 |
 | --- | --- |
 | `201` | 批次创建成功（`version` 为 1，全部未确认） |
-| `200` | 读取、确认、blank 替换成功（修改成功时 `version` 加 1） |
-| `404` | 批次 id 不存在；或确认时样本 id 不属于该批次 |
-| `409` | `expected_version` 过期；重复确认已确认样本；替换 blank 会改变任一已确认样本的结果（消息含样本 id） |
-| `422` | 计算失败或请求结构非法：创建时消息以 `sample "<id>": ` 或 `blank: ` 指出出错对象；替换时只有 blank 可变，故失败前缀为 `blank: `。另有样本数不在 1～8、样本 id 为空/重复、类型错误、缺字段等 |
+| `200` | 读取、确认、blank 替换、精密度检查成功（修改成功时 `version` 加 1；检查为只读，版本不变） |
+| `404` | 批次 id 不存在；或确认/精密度检查时样本 id 不属于该批次 |
+| `409` | `expected_version` 过期；重复确认已确认样本；替换 blank 会改变任一已确认样本的结果（消息含样本 id）；精密度检查时任一样本未确认 |
+| `422` | 计算失败或请求结构非法：创建时消息以 `sample "<id>": ` 或 `blank: ` 指出出错对象；替换时只有 blank 可变，故失败前缀为 `blank: `。另有样本数不在 1～8、样本 id 为空/重复、类型错误、缺字段等。精密度检查：目标为内标或不在参考峰表、样本 id 重复/数量越界、阈值不在 0～100、目标未归属或第一内标校正面积为 0（消息含样本 id）、均值 μ 为 0 |
 
 ### 持久化与部署
 
@@ -778,6 +878,9 @@ pytest -q
 用同一 SQLite 文件重开存储模拟容器重启后的持久化读取，
 以及读写交错回归测试：读取在批次行后暂停、另一连接合法提交新版本再放行，
 断言响应只含完整旧状态或完整新状态，且读成功/404/中途异常都结束事务并关闭连接。
+精密度检查测试覆盖精确分数（面积比、μ、s²、q）、请求顺序、阈值等号边界、
+零目标面积保留、404/409/422 各分支与错误优先级、“检查不写库”（只读事务日志），
+以及检查读取暂停期间另一连接合法提交确认的交错回归（只见完整旧状态或完整新状态）。
 
 ## 目录结构
 
@@ -789,7 +892,8 @@ app/
   standard_addition.py  # 标准加入法：逐次归属 + 精确最小二乘（纯函数）
   integration.py        # 峰面积积分：分段 + 扣基线 + 精确梯形积分（纯函数）
   blank_subtraction.py  # 空白扣除：双运行积分 + 归属 + 精确相减（纯函数）
-  batches.py            # 可复核批次工作流：创建/确认/换 blank 重算（复用扣除逻辑）
+  precision.py          # 精密度检查：面积比 + 精确 μ/s²/q 与 RSD 阈值判定（纯函数）
+  batches.py            # 可复核批次工作流：创建/确认/换 blank 重算/精密度检查
   storage.py            # SQLite 持久化：原子事务 + 版本乐观锁 + 已确认结果比较
 tests/                  # API 测试与算法对拍测试
 Dockerfile

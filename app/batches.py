@@ -6,6 +6,7 @@
 计算全部在写事务外完成，因此计算失败（422）绝不会触碰已提交状态。
 读取经存储层单个只读事务完成：版本、blank、样本输入/顺序/结果与确认状态
 来自同一次完整提交（WAL 快照），读写交错时只见完整旧状态或完整新状态。
+精密度检查复用同一读取，对已确认结果做纯计算，不写库、不改变确认或版本。
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import os
 from typing import Any
 
 from .blank_subtraction import blank_subtraction
+from .precision import precision_check
 from .storage import BatchStore, ConfirmedResultChanged
 
 # 与单次接口相同的共用扣除参数
@@ -32,6 +34,7 @@ __all__ = [
     "get_batch",
     "confirm_sample",
     "replace_blank",
+    "check_precision",
     "get_store",
     "reset_store",
 ]
@@ -148,3 +151,18 @@ def replace_blank(
         blank,
         new_results,
     )
+
+
+def check_precision(
+    batch_id: str,
+    sample_ids: list[str],
+    target_ref_id: str,
+    max_rsd_percent: int,
+) -> dict[str, Any]:
+    """同一样本多次进样的精密度检查（只读，不写库、不改变确认或版本）。
+
+    批次经存储层**单次完整读取**（WAL 快照）取得，随后全部计算都在该
+    快照上进行；检查期间的并发确认/换 blank 不会被拼进本次结果。
+    """
+    batch = get_store().get(batch_id)  # 批次不存在抛 BatchNotFound -> 404
+    return precision_check(batch, sample_ids, target_ref_id, max_rsd_percent)

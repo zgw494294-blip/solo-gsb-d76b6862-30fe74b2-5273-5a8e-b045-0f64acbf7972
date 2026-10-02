@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 
@@ -231,3 +231,45 @@ class BatchResponse(BaseModel):
     tolerance_ms: int
     blank: BlankSubtractionRun
     samples: list[BatchSampleOut]
+
+
+# ---------------------------------------------------------------------------
+# 批次精密度检查（POST /v1/blank-subtraction-batches/{batch_id}/precision-check）
+# ---------------------------------------------------------------------------
+
+class PrecisionCheckRequest(BaseModel):
+    # 2～8 个互异、非空的样本 id；面积比按此顺序返回
+    sample_ids: list[Annotated[StrictStr, Field(min_length=1)]] = Field(
+        min_length=2, max_length=8
+    )
+    # 非内标的目标参考 id
+    target_ref_id: StrictStr
+    # 允许的最大 RSD 百分比（整数 0～100）：
+    # 10000·q ≤ max_rsd_percent² 判为合格（等号通过）
+    max_rsd_percent: StrictInt = Field(ge=0, le=100)
+
+    @field_validator("sample_ids")
+    @classmethod
+    def _sample_ids_distinct(cls, v: list[str]) -> list[str]:
+        if len(set(v)) != len(v):
+            raise ValueError("sample ids must be distinct")
+        return v
+
+
+class PrecisionRatioOut(BaseModel):
+    # 与请求 sample_ids 同序：目标校正面积 ÷ 第一内标校正面积
+    sample_id: str
+    area_ratio: FractionOut
+
+
+class PrecisionCheckResponse(BaseModel):
+    batch_id: str
+    # 本次完整读取看到的批次版本（检查不写库、不改变确认或版本）
+    version: int
+    target_ref_id: str
+    max_rsd_percent: int
+    area_ratios: list[PrecisionRatioOut]
+    mean: FractionOut  # 面积比均值 μ
+    variance: FractionOut  # 样本方差 s²（分母 N−1）
+    q: FractionOut  # q = s²/μ²
+    passed: bool

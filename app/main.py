@@ -2,7 +2,8 @@
 POST /v1/standard-addition 标准加入法定量、
 POST /v1/integrate 原始强度采样峰面积积分、
 POST /v1/blank-subtraction 样本/空白两次运行的空白扣除，
-/v1/blank-subtraction-batches 共用空白的可复核批次（SQLite 持久化）。"""
+/v1/blank-subtraction-batches 共用空白的可复核批次（SQLite 持久化），
+POST .../precision-check 已确认批次结果的进样精密度检查（只读）。"""
 
 from __future__ import annotations
 
@@ -24,9 +25,12 @@ from .models import (
     BlankSubtractionResponse,
     IntegrateRequest,
     IntegrateResponse,
+    PrecisionCheckRequest,
+    PrecisionCheckResponse,
     StandardAdditionRequest,
     StandardAdditionResponse,
 )
+from .precision import PrecisionCheckError, UnconfirmedResult
 from .standard_addition import standard_addition
 from .storage import (
     AlreadyConfirmed,
@@ -37,10 +41,11 @@ from .storage import (
 
 app = FastAPI(
     title="离线色谱峰归属 API",
-    version="1.1.0",
+    version="1.2.0",
     description="基于两对互异内标的正斜率仿射校准与保序一对一峰归属；"
-    "另提供标准加入法定量、原始强度采样峰面积积分、空白扣除，"
-    "以及共用空白的可复核批次（确认/换空白重算，SQLite 持久化）。",
+    "另提供标准加入法定量、原始强度采样峰面积积分、空白扣除、"
+    "共用空白的可复核批次（确认/换空白重算，SQLite 持久化），"
+    "以及对已确认批次结果的只读进样精密度检查。",
 )
 
 
@@ -79,6 +84,22 @@ async def confirmed_result_changed_handler(
     request: Request, exc: batches.ConfirmedResultChanged
 ) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(UnconfirmedResult)
+async def unconfirmed_result_handler(
+    request: Request, exc: UnconfirmedResult
+) -> JSONResponse:
+    # 精密度检查只接受已确认样本：任一所请样本未确认返回 409。
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(PrecisionCheckError)
+async def precision_check_error_handler(
+    request: Request, exc: PrecisionCheckError
+) -> JSONResponse:
+    # 目标/内标未归属、内标面积为零、目标参考非法、均值为零等：422。
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
 @app.get("/health")
@@ -190,4 +211,22 @@ def batch_replace_blank(
         batch_id,
         {"blank": request.blank.model_dump(),
          "expected_version": request.expected_version},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 进样精密度检查（只读：不写库、不改变确认或版本）
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/v1/blank-subtraction-batches/{batch_id}/precision-check",
+    response_model=PrecisionCheckResponse,
+)
+def batch_precision_check(batch_id: str, request: PrecisionCheckRequest) -> dict:
+    return batches.precision_check_batch(
+        batch_id,
+        sample_ids=list(request.sample_ids),
+        target_ref_id=request.target_ref_id,
+        max_rsd_percent=request.max_rsd_percent,
     )

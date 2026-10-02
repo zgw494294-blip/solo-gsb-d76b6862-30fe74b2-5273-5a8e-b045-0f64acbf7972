@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from typing_extensions import Annotated
 
 
 class ReferencePeak(BaseModel):
@@ -231,3 +232,46 @@ class BatchResponse(BaseModel):
     tolerance_ms: int
     blank: BlankSubtractionRun
     samples: list[BatchSampleOut]
+
+
+# ---------------------------------------------------------------------------
+# 进样精密度检查（POST .../precision-check，只读）
+# ---------------------------------------------------------------------------
+
+class PrecisionCheckRequest(BaseModel):
+    # 2～8 个互异样本 id（属于路径所指批次）；逐项非空
+    sample_ids: list[Annotated[StrictStr, Field(min_length=1)]] = Field(
+        min_length=2, max_length=8
+    )
+    # 目标参考 id：必须是批次参考峰之一且不得是内标（业务层校验）
+    target_ref_id: StrictStr
+    # 最大允许 RSD 百分比（整数）；10000·q ≤ 阈值² 判合格，等号通过
+    max_rsd_percent: StrictInt = Field(ge=0, le=100)
+
+    @field_validator("sample_ids")
+    @classmethod
+    def _sample_ids_unique(cls, v: list[str]) -> list[str]:
+        if len(set(v)) != len(v):
+            raise ValueError("sample ids must be unique within a precision check")
+        return v
+
+
+class PrecisionSampleOut(BaseModel):
+    # 与请求 sample_ids 同序；area_ratio = 目标校正面积 ÷ 第一内标校正面积
+    sample_id: str
+    area_ratio: FractionOut
+
+
+class PrecisionCheckResponse(BaseModel):
+    batch_id: str
+    # 所用的那次完整批次读取的版本（检查不改版本）
+    version: int
+    target_ref_id: str
+    max_rsd_percent: int
+    samples: list[PrecisionSampleOut]
+    # μ：面积比均值；s²：样本方差（分母 N−1）；q = s²/μ²；均为约分分数
+    mean: FractionOut
+    sample_variance: FractionOut
+    q: FractionOut
+    # 10000·q ≤ max_rsd_percent² 为 true（等号通过）
+    passed: bool

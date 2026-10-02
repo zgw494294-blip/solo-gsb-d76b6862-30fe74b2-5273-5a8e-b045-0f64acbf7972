@@ -14,6 +14,7 @@ import os
 from typing import Any
 
 from .blank_subtraction import blank_subtraction
+from .precision import precision_check
 from .storage import BatchStore, ConfirmedResultChanged
 
 # 与单次接口相同的共用扣除参数
@@ -32,6 +33,7 @@ __all__ = [
     "get_batch",
     "confirm_sample",
     "replace_blank",
+    "precision_check_batch",
     "get_store",
     "reset_store",
 ]
@@ -147,4 +149,27 @@ def replace_blank(
         expected_version,
         blank,
         new_results,
+    )
+
+
+def precision_check_batch(
+    batch_id: str,
+    *,
+    sample_ids: list[str],
+    target_ref_id: str,
+    max_rsd_percent: int,
+) -> dict[str, Any]:
+    """精密度检查：只读，不写库、不改变确认或版本。
+
+    先由存储层在**单个只读事务**内取整批（WAL 快照：版本、参考峰、内标、
+    各样本结果与确认状态来自同一次完整提交），再在事务外基于该快照计算；
+    全程不再发起第二次读取，结果中的 ``version`` 即所用快照的版本。
+    """
+    # 唯一一次读取：未知批次在此抛 BatchNotFound -> 404
+    batch = get_store().get(batch_id)
+    return precision_check(
+        batch,
+        sample_ids=sample_ids,
+        target_ref_id=target_ref_id,
+        max_rsd_percent=max_rsd_percent,
     )

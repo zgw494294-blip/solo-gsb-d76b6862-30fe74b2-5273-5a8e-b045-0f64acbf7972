@@ -1,4 +1,4 @@
-# 离线色谱峰归属 / 标准加入法定量 / 峰面积积分 / 空白扣除 / 可复核批次 API
+# 离线色谱峰归属 / 标准加入法定量 / 峰面积积分 / 空白扣除 / 可复核批次 / 进样精密度 API
 
 - **峰归属**：基于 **两对互异内标** 对实测色谱峰进行正斜率仿射时间校准，并将实测峰与参考峰做
   **保序、一对一** 的最优归属。
@@ -14,6 +14,10 @@
   初始版本 1、全部未确认；支持读取、按样本 id 逐项确认、替换 blank 后整批重算。
   修改携带 `expected_version` 乐观锁，成功版本加 1，过期返回 409；
   已确认结果约束 blank 替换——峰顺序、参考 id、`time_ms`、约分校正面积任一改变即整批拒绝。
+- **进样精密度检查**：对已**确认**批次中 2～8 个互异样本（同一样本的多次进样），
+  用**一次完整读取**快照内的已确认扣除结果，逐样本以目标校正面积 ÷ 第一内标校正面积，
+  精确计算均值 μ、样本方差 s²（分母 N−1）与 q=s²/μ²，按 `10000·q ≤ 阈值²` 判定 RSD 合格。
+  **只读**：不写库、不改变确认或版本。
 
 Python 3.12 + FastAPI，全部时间/偏差/拟合/面积计算使用 `fractions.Fraction` 精确有理数，
 返回约分后的 `n/d`。
@@ -30,6 +34,7 @@ docker compose up --build -d
 - 峰面积积分：`POST http://localhost:8000/v1/integrate`
 - 空白扣除：`POST http://localhost:8000/v1/blank-subtraction`
 - 可复核批次：`POST/GET http://localhost:8000/v1/blank-subtraction-batches`
+- 进样精密度：`POST http://localhost:8000/v1/blank-subtraction-batches/{batch_id}/precision-check`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互文档：`http://localhost:8000/docs`（Swagger UI）
 
@@ -757,6 +762,180 @@ curl -s -X POST \
 - 旧的无状态接口（`/v1/assign`、`/v1/standard-addition`、`/v1/integrate`、
   `/v1/blank-subtraction`）保持不变，不使用数据库。
 
+## 进样精密度检查（`POST .../{batch_id}/precision-check`）
+
+对**同一个样本的多次进样**（批次中的 2～8 个互异样本 id）做进样精密度（RSD）检查：
+取批次**一次完整读取**（单个只读事务、WAL 快照）里**已确认**样本的扣除结果，逐样本计算
+
+```
+area_ratio = 目标参考峰的约分校正面积 ÷ 第一枚内标(is_ref_id_1)的约分校正面积
+```
+
+再用 `fractions.Fraction` 精确计算（N = 样本数）：
+
+```
+μ  = (Σ area_ratio) / N                    （均值）
+s² = (Σ (area_ratio − μ)²) / (N − 1)       （样本方差，分母 N−1）
+q  = s² / μ²
+RSD% = 100 · s / μ
+```
+
+合格判定为 **`10000·q ≤ max_rsd_percent²`，全程整数比较、等号通过**。
+检查**只读**：不写库、不确认/反确认、不改版本；响应中的 `version` 即所用快照的版本，
+即使检查期间另一连接确认了样本，本次也只用快照中的旧确认状态（见文末“快照语义”）。
+
+### 从创建、确认到检查的可执行示例
+
+先创建一个含 3 个样本（同一样本的三次进样）与 3 个参考峰（两枚内标 `S1`/`S2` + 目标 `T`）
+的批次。每次运行 7 个采样点、3 个峰顶（t=1 的 `S1` 为第一内标，t=3 的 `T` 为目标，
+t=5 的 `S2` 为第二内标）；blank 三处峰面积为 0/2/0，三次进样的目标校正面积分别为 2/4/6、
+第一内标校正面积均为 4。把请求体保存为 `batch.json`：
+
+```bash
+cat > batch.json <<'JSON'
+{
+  "reference_peaks": [
+    {"id": "S1", "time_ms": 1},
+    {"id": "T",  "time_ms": 3},
+    {"id": "S2", "time_ms": 5}
+  ],
+  "is_ref_id_1": "S1", "is_ref_id_2": "S2", "tolerance_ms": 0,
+  "blank": {
+    "samples": [
+      {"time_ms": 0, "intensity": 1}, {"time_ms": 1, "intensity": 1},
+      {"time_ms": 2, "intensity": 1}, {"time_ms": 3, "intensity": 3},
+      {"time_ms": 4, "intensity": 1}, {"time_ms": 5, "intensity": 1},
+      {"time_ms": 6, "intensity": 1}
+    ],
+    "start_index": 0, "end_index": 6,
+    "apex_indices": [1, 3, 5],
+    "is_apex_idx_1": 0, "is_apex_idx_2": 2
+  },
+  "samples": [
+    {"id": "inj-1",
+     "samples": [
+       {"time_ms": 0, "intensity": 1}, {"time_ms": 1, "intensity": 5},
+       {"time_ms": 2, "intensity": 1}, {"time_ms": 3, "intensity": 5},
+       {"time_ms": 4, "intensity": 1}, {"time_ms": 5, "intensity": 5},
+       {"time_ms": 6, "intensity": 1}],
+     "start_index": 0, "end_index": 6, "apex_indices": [1, 3, 5],
+     "is_apex_idx_1": 0, "is_apex_idx_2": 2},
+    {"id": "inj-2",
+     "samples": [
+       {"time_ms": 0, "intensity": 1}, {"time_ms": 1, "intensity": 5},
+       {"time_ms": 2, "intensity": 1}, {"time_ms": 3, "intensity": 7},
+       {"time_ms": 4, "intensity": 1}, {"time_ms": 5, "intensity": 5},
+       {"time_ms": 6, "intensity": 1}],
+     "start_index": 0, "end_index": 6, "apex_indices": [1, 3, 5],
+     "is_apex_idx_1": 0, "is_apex_idx_2": 2},
+    {"id": "inj-3",
+     "samples": [
+       {"time_ms": 0, "intensity": 1}, {"time_ms": 1, "intensity": 5},
+       {"time_ms": 2, "intensity": 1}, {"time_ms": 3, "intensity": 9},
+       {"time_ms": 4, "intensity": 1}, {"time_ms": 5, "intensity": 5},
+       {"time_ms": 6, "intensity": 1}],
+     "start_index": 0, "end_index": 6, "apex_indices": [1, 3, 5],
+     "is_apex_idx_1": 0, "is_apex_idx_2": 2}
+  ]
+}
+JSON
+
+BID=$(curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches \
+  -H 'Content-Type: application/json' -d @batch.json | jq -r .batch_id)
+```
+
+记录批次 id 后**逐项确认**三次进样（精密度检查只接受已确认样本；每次确认版本 +1）：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches/$BID/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_id": "inj-1", "expected_version": 1}' >/dev/null
+curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches/$BID/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_id": "inj-2", "expected_version": 2}' >/dev/null
+curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches/$BID/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_id": "inj-3", "expected_version": 3}' >/dev/null
+```
+
+确认后做精密度检查（阈值 50%）：
+
+```bash
+curl -s -X POST \
+  http://localhost:8000/v1/blank-subtraction-batches/$BID/precision-check \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sample_ids": ["inj-1", "inj-2", "inj-3"],
+    "target_ref_id": "T",
+    "max_rsd_percent": 50
+  }'
+```
+
+面积比为 `2/4=1/2`、`4/4=1`、`6/4=3/2`，故 μ=1、s²=1/4、q=1/4，RSD 恰为 50%；
+`10000·q = 2500 = 50²`，**等号通过**，响应为：
+
+```json
+{
+  "batch_id": "…",
+  "version": 4,
+  "target_ref_id": "T",
+  "max_rsd_percent": 50,
+  "samples": [
+    {"sample_id": "inj-1", "area_ratio": {"n": 1, "d": 2}},
+    {"sample_id": "inj-2", "area_ratio": {"n": 1, "d": 1}},
+    {"sample_id": "inj-3", "area_ratio": {"n": 3, "d": 2}}
+  ],
+  "mean": {"n": 1, "d": 1},
+  "sample_variance": {"n": 1, "d": 4},
+  "q": {"n": 1, "d": 4},
+  "passed": true
+}
+```
+
+阈值改成 49 时（`10000·q = 2500 > 49² = 2401`）其余字段不变、`passed` 为 `false`。
+面积比、μ、s²、q 均为**约分**分数 `{"n", "d"}`，分母恒正；`samples` 与请求的
+`sample_ids` **同序**（可与批次内顺序不同，重复检查不写库）。
+
+### 请求
+
+`Content-Type: application/json`，路径参数为批次 id：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `sample_ids` | 字符串数组，长度 **2～8** | 批次内样本 id，**互异**且逐项非空；响应按此顺序 |
+| `target_ref_id` | 字符串 | 目标参考 id：必须是批次参考峰之一，且**不得**等于两枚内标 |
+| `max_rsd_percent` | 整数 | 最大允许 RSD 百分比，范围 **0～100** |
+
+### 计算细则
+
+- 每个样本取**已确认结果**中归属给目标的峰的约分校正面积，除以归属给
+  **第一枚内标** `is_ref_id_1` 的峰的约分校正面积。
+- 目标校正面积为 **0** 是合法观测：面积比 0 **保留**并参与统计；
+  仅当所有面积比都为 0（μ=0）时无法定义 q，返回 422。
+- 第二枚内标 `is_ref_id_2` 不参与归一化。
+- 全程 `fractions.Fraction`，不转浮点；阈值判定为整数比较，无舍入误差，**等号算通过**。
+
+### 错误码
+
+| 状态 | 触发情形 |
+| --- | --- |
+| `200` | 检查成功（不改变任何状态；`version` 为所用快照的版本） |
+| `404` | 批次 id 不存在；或 `sample_ids` 中任一 id 不属于该批次（消息含样本 id） |
+| `409` | 所请样本中任一个在读取快照中**未确认**（消息含样本 id） |
+| `422` | 目标参考 id 不在批次参考峰中，或目标就是内标之一；某样本的目标峰在已确认结果中**未归属**；某样本的第一内标未归属或**校正面积为零**（逐样本错误消息指出样本 id）；全部面积比为零导致 μ=0；样本数不在 2～8、id 不互异/为空、阈值不在 0～100、严格类型错误或缺字段 |
+
+判定顺序：先在单个只读事务内读取整批（批次不存在直接 404），随后依次检查
+样本是否全部存在（404）→ 是否全部已确认（409）→ 目标参考合法性 →
+逐样本取面积比（422，指出样本 id）→ μ 是否为零。
+
+### 快照语义
+
+读取与 GET 一样包在单个只读事务（`BEGIN` … `COMMIT`/`ROLLBACK`）内：
+版本、参考峰、内标与各样本结果/确认状态来自**同一次完整提交**。
+若检查开始时样本未确认，即使读取暂停期间另一连接把它们全部确认，本次检查
+仍只看到旧快照而返回 409，绝不会拼接“旧结果 + 新确认状态”；
+重发请求（新读取）才会使用新版本。检查不发起第二次读取、不执行任何写语句。
+
 ## 本地开发与测试
 
 不用 Docker 时：
@@ -778,6 +957,9 @@ pytest -q
 用同一 SQLite 文件重开存储模拟容器重启后的持久化读取，
 以及读写交错回归测试：读取在批次行后暂停、另一连接合法提交新版本再放行，
 断言响应只含完整旧状态或完整新状态，且读成功/404/中途异常都结束事务并关闭连接。
+进样精密度检查测试覆盖面积比顺序、μ/s²（分母 N−1）/q 的精确分数、阈值等号边界、
+零目标保留与 μ=0、404/409/422 各分支与错误消息中的样本 id、
+“检查不改版本/确认/结果、无写 SQL”，以及快照期间被确认仍按旧快照返回 409 的交错用例。
 
 ## 目录结构
 
@@ -789,7 +971,8 @@ app/
   standard_addition.py  # 标准加入法：逐次归属 + 精确最小二乘（纯函数）
   integration.py        # 峰面积积分：分段 + 扣基线 + 精确梯形积分（纯函数）
   blank_subtraction.py  # 空白扣除：双运行积分 + 归属 + 精确相减（纯函数）
-  batches.py            # 可复核批次工作流：创建/确认/换 blank 重算（复用扣除逻辑）
+  batches.py            # 可复核批次工作流：创建/确认/换 blank 重算/精密度检查
+  precision.py          # 进样精密度：面积比 + μ/s²(N−1)/q 精确计算（纯函数，只读）
   storage.py            # SQLite 持久化：原子事务 + 版本乐观锁 + 已确认结果比较
 tests/                  # API 测试与算法对拍测试
 Dockerfile
